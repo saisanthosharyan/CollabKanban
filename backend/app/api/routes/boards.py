@@ -1,3 +1,4 @@
+
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -27,6 +28,7 @@ from app.schemas.boards import (
     TaskUpdate,
     TaskResponse,
 )
+from app.websockets.manager import manager
 
 
 router = APIRouter(
@@ -34,6 +36,10 @@ router = APIRouter(
     tags=["Kanban Boards"],
 )
 
+
+# -------------------------
+# BOARD HELPERS
+# -------------------------
 
 def get_board_or_404(
     db: Session,
@@ -66,10 +72,14 @@ def validate_assignee(
     if user_id is None:
         return
 
-    user = db.query(User).filter(
-        User.id == user_id,
-        User.is_active.is_(True),
-    ).first()
+    user = (
+        db.query(User)
+        .filter(
+            User.id == user_id,
+            User.is_active.is_(True),
+        )
+        .first()
+    )
 
     if not user:
         raise HTTPException(status_code=404, detail="Assignee not found.")
@@ -128,6 +138,49 @@ def add_activity(
 
 
 # -------------------------
+# WEBSOCKET EVENT HELPER
+# -------------------------
+
+def broadcast_task_event(
+    organization_id: int,
+    tenant_id: int,
+    board_id: int,
+    event_type: str,
+    task: Task | None = None,
+    task_id: int | None = None,
+    actor_id: int | None = None,
+):
+    """
+    Broadcast a task event to users connected to the
+    same organization, tenant, and board.
+    """
+
+    room = (
+        f"org:{organization_id}:"
+        f"tenant:{tenant_id}:"
+        f"board:{board_id}"
+    )
+
+    message = {
+        "type": event_type,
+        "organization_id": organization_id,
+        "tenant_id": tenant_id,
+        "board_id": board_id,
+        "actor_id": actor_id,
+    }
+
+    if task is not None:
+        message["task"] = (
+            TaskResponse.model_validate(task).model_dump(mode="json")
+        )
+
+    if task_id is not None:
+        message["task_id"] = task_id
+
+    manager.broadcast_sync(room, message)
+
+
+# -------------------------
 # BOARDS
 # -------------------------
 
@@ -158,7 +211,6 @@ def create_board(
     db.add(board)
     db.flush()
 
-    # Every new board starts with three standard columns.
     default_columns = [
         BoardColumn(
             tenant_id=tenant_id,
@@ -374,6 +426,15 @@ def create_task(
     db.commit()
     db.refresh(task)
 
+    broadcast_task_event(
+        organization_id=organization_id,
+        tenant_id=tenant_id,
+        board_id=board_id,
+        event_type="task_created",
+        task=task,
+        actor_id=current_user.id,
+    )
+
     return task
 
 
@@ -455,7 +516,6 @@ def update_task(
             detail="No task changes were provided.",
         )
 
-    # Do not allow null values for required fields.
     for field in ("title", "priority", "column_id", "position"):
         if field in changes and changes[field] is None:
             raise HTTPException(
@@ -525,7 +585,7 @@ def update_task(
 
     db.commit()
 
-    return (
+    updated_task = (
         db.query(Task)
         .filter(
             Task.id == task_id,
@@ -534,6 +594,18 @@ def update_task(
         )
         .first()
     )
+
+    if updated_task is not None:
+        broadcast_task_event(
+            organization_id=organization_id,
+            tenant_id=tenant_id,
+            board_id=board_id,
+            event_type="task_updated",
+            task=updated_task,
+            actor_id=current_user.id,
+        )
+
+    return updated_task
 
 
 @router.delete(
@@ -578,7 +650,18 @@ def delete_task(
         {"title": task.title},
     )
 
+    deleted_task_id = task.id
+
     db.delete(task)
     db.commit()
+
+    broadcast_task_event(
+        organization_id=organization_id,
+        tenant_id=tenant_id,
+        board_id=board_id,
+        event_type="task_deleted",
+        task_id=deleted_task_id,
+        actor_id=current_user.id,
+    )
 
     return None
